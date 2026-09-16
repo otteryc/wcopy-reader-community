@@ -1,0 +1,24 @@
+[package]
+name = "wcopy-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Native GUI for the NSCCN wCopy reader (egui + statically linked hidapi)"
+
+[[bin]]
+name = "wcopy-gui"
+path = "src/main.rs"
+
+[dependencies]
+wcopy = { path = ".." }
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.29"
+
+# `cargo install cargo-bundle` then `cargo bundle --release` -> a macOS .app
+# (built to target/release/bundle/osx/wCopy.app). Add `icon = ["path.icns"]` for an icon.
+[package.metadata.bundle]
+name = "wCopy"
+identifier = "com.otteryc.wcopy"
+short_description = "NSCCN wCopy Smart Reader driver"
+long_description = "Read/write NFC tag UIDs and MIFARE Classic data via the NSCCN wCopy Smart Reader (PN532)."
+category = "public.app-category.utilities"
+osx_minimum_system_version = "10.15"

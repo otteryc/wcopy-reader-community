@@ -1,0 +1,26 @@
+[package]
+name = "wcopy"
+version = "0.1.0"
+edition = "2021"
+description = "Driver for the NSCCN wCopy Smart Reader (PN532 USB-HID), statically linked hidapi"
+
+[lib]
+name = "wcopy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wcopy"
+path = "src/main.rs"
+
+[dependencies]
+# The hidapi crate vendors and STATICALLY links the C hidapi library from source.
+# On macOS it links the IOKit/CoreFoundation system frameworks (always present) — so the
+# resulting binary needs no external libhidapi.dylib and no DYLD_LIBRARY_PATH.
+hidapi = { version = "2.6", features = ["macos-shared-device"] }
+
+[profile.release]
+lto = true
+strip = true
+
+[workspace]
+members = ["wcopy-gui", "wcopy-wedge"]

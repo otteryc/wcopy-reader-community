@@ -1,0 +1,13 @@
+[package]
+name = "wcopy-wedge"
+version = "0.1.0"
+edition = "2021"
+description = "Keyboard-wedge: types a tag's UID (decimal) + Enter into the focused app"
+
+[[bin]]
+name = "wcopy-wedge"
+path = "src/main.rs"
+
+[dependencies]
+wcopy = { path = ".." }
+enigo = "0.2"
