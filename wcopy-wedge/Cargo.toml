@@ -2,6 +2,7 @@
 name = "wcopy-wedge"
 version = "0.1.0"
 edition = "2021"
+license = "BSD-4-Clause"
 description = "Keyboard-wedge: types a tag's UID (decimal) + Enter into the focused app"
 
 [[bin]]

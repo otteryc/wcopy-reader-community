@@ -141,7 +141,9 @@ dictionary attack over common default keys.
 
 - Protocol recovered by reverse-engineering the vendor's `nfcPro` Windows application, for
   interoperability. No vendor code or binaries are included in this repository.
-- The GUI embeds **Hack Nerd Font** (Hack by Source Foundry, patched by Nerd Fonts) — see
-  [`assets/LICENSE.md`](assets/LICENSE.md) and [`assets/README.md`](assets/README.md) for its
-  license and version.
-- Driver/source license: add a top-level `LICENSE` before distributing (MIT recommended).
+- The GUI embeds **Hack Nerd Font** (Hack by Source Foundry, patched by Nerd Fonts), which
+  keeps its own license — see [`assets/LICENSE.md`](assets/LICENSE.md) and
+  [`assets/README.md`](assets/README.md).
+- The driver/source code is licensed under the **BSD 4-Clause License** — see
+  [`LICENSE`](LICENSE). Note clause 3 (the "advertising clause"): products advertising use of
+  this software must acknowledge it.

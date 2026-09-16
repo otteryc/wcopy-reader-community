@@ -2,6 +2,7 @@
 name = "wcopy-gui"
 version = "0.1.0"
 edition = "2021"
+license = "BSD-4-Clause"
 description = "Native GUI for the NSCCN wCopy reader (egui + statically linked hidapi)"
 
 [[bin]]

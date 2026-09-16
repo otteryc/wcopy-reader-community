@@ -2,6 +2,7 @@
 name = "wcopy"
 version = "0.1.0"
 edition = "2021"
+license = "BSD-4-Clause"
 description = "Driver for the NSCCN wCopy Smart Reader (PN532 USB-HID), statically linked hidapi"
 
 [lib]
