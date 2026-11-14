@@ -22,6 +22,10 @@ fn print_usage() {
          \x20 --raw-vendor <HEX>   send a raw MCU payload (no PN532 wrapper), e.g. \"FF 00 6B 30\"\n\
          \x20 --read-register <ADDR> ReadRegister, e.g. 0x6303\n\
          \x20 --cmd \"<HEX...>\"       raw PN532 command, e.g. \"06 63 03\"\n\
+         \x20 --lf-info              125 kHz: print device/version + serial strings\n\
+         \x20 --lf-read              125 kHz: init + read one EM4100 tag ID (5 bytes)\n\
+         \x20 --lf-write <HEX10>     125 kHz: write a 5-byte EM4100 ID to a T5577/EM4305 tag\n\
+         \x20 --beep                 sound the reader's buzzer + LED\n\
          \x20 -h, --help             this help\n\
          \n\
          With no action flag, prints firmware + tag."
@@ -77,6 +81,10 @@ fn run() -> Result<(), Error> {
     let mut read_reg: Option<String> = None;
     let mut raw_cmd: Option<String> = None;
     let mut raw_vendor: Option<String> = None;
+    let mut do_lf_info = false;
+    let mut do_lf_read = false;
+    let mut lf_write: Option<String> = None;
+    let mut do_beep = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -110,6 +118,13 @@ fn run() -> Result<(), Error> {
                 i += 1;
                 raw_vendor = args.get(i).cloned();
             }
+            "--lf-info" => do_lf_info = true,
+            "--lf-read" => do_lf_read = true,
+            "--lf-write" => {
+                i += 1;
+                lf_write = args.get(i).cloned();
+            }
+            "--beep" => do_beep = true,
             other => {
                 eprintln!("unknown argument: {other}");
                 print_usage();
@@ -137,7 +152,11 @@ fn run() -> Result<(), Error> {
         || write_uid.is_some()
         || read_reg.is_some()
         || raw_cmd.is_some()
-        || raw_vendor.is_some());
+        || raw_vendor.is_some()
+        || do_lf_info
+        || do_lf_read
+        || lf_write.is_some()
+        || do_beep);
 
     if do_fw || default {
         println!("Firmware: {}", dev.get_firmware()?);
@@ -242,6 +261,46 @@ fn run() -> Result<(), Error> {
             reply.len(),
             hexs.join(" ")
         );
+    }
+    if do_lf_info {
+        println!("LF device info: {}", dev.lf_device_info()?);
+        println!("LF serial:      {}", dev.lf_serial()?);
+    }
+    if do_lf_read {
+        dev.lf_init()?;
+        match dev.lf_read_em4100()? {
+            Some(id) => {
+                let hexs: Vec<String> = id.iter().map(|b| format!("{b:02X}")).collect();
+                println!("LF tag (EM4100): {}", hexs.join(""));
+            }
+            None => println!("LF tag: no 125 kHz tag on reader"),
+        }
+    }
+    if let Some(hex) = lf_write {
+        let bytes = parse_hex_str(&hex).ok_or_else(|| Error::BadArg(format!("bad ID hex: {hex}")))?;
+        if bytes.len() != 5 {
+            return Err(Error::BadArg(format!("need 5 bytes (10 hex digits), got {}", bytes.len())));
+        }
+        let mut id = [0u8; 5];
+        id.copy_from_slice(&bytes);
+        dev.lf_write_em4100(&id)?;
+        dev.lf_init()?;
+        match dev.lf_read_em4100()? {
+            Some(back) if back == id => println!(
+                "wrote LF ID {}: verify OK",
+                id.iter().map(|b| format!("{b:02X}")).collect::<String>()
+            ),
+            Some(back) => println!(
+                "wrote LF ID {}, but read back {} -- MISMATCH",
+                id.iter().map(|b| format!("{b:02X}")).collect::<String>(),
+                back.iter().map(|b| format!("{b:02X}")).collect::<String>()
+            ),
+            None => println!("wrote LF ID, but could not read a tag back to verify"),
+        }
+    }
+    if do_beep {
+        dev.beep()?;
+        println!("beeped");
     }
     Ok(())
 }

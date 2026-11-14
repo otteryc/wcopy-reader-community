@@ -6,7 +6,8 @@
 //!
 //! # Two-layer wire format
 //! Inner (vendor PN532): `FF 00 00 00 | len(cmd)+1 | D4 | cmd...`   (`D4` = TFI host->PN532)
-//! Outer HID report (64 B): `01 | len(inner)+6 | seqLo seqHi | inner... | ~sum(bytes[1..]) | FE`
+//! Outer HID report (64 B): `01 | len(inner)+6 | seqLo seqHi | inner... | cksum | FE`, where
+//! `cksum = ~sum(bytes[0..cksum_pos])` — the sum includes the leading `0x01`/`0x02` marker.
 //! The report is unnumbered; hidapi prepends/strips a leading `0x00` report-id, so we send
 //! `00` + the 64-byte content (which starts at the `0x01` marker).
 //! Reply: `02 | LEN | seq(2) | D5 | cmd+1 | data... | cksum | FD`; the MCU appends a
@@ -345,6 +346,37 @@ pub fn parse_reply(raw: &[u8], req_cmd: u8) -> Result<Vec<u8>> {
         data.truncate(data.len() - 2);
     }
     Ok(data)
+}
+
+/// Validate a vendor-MCU IN report (`02 LEN seqLo seqHi <data...> cksum FD`, no PN532 `D5`
+/// TFI layer) and return its data bytes. Checksum is `(!sum(bytes[0..cksum_pos])) & 0xFF` —
+/// the sum includes the leading `0x02` marker byte — the same running-checksum scheme
+/// [`build_report_raw`] uses when writing, confirmed
+/// against real captures of both a short "no tag" reply (`02 07 .. 00 .. FD`, 1 data byte)
+/// and a 6-byte EM4100 ID reply.
+pub fn parse_vendor_reply(raw: &[u8]) -> Result<Vec<u8>> {
+    if raw.is_empty() {
+        return Err(Error::Reply("no reply (timeout)".into()));
+    }
+    if raw[0] != 0x02 {
+        return Err(Error::Reply(format!("bad start 0x{:02X}", raw[0])));
+    }
+    let len = raw[1] as usize;
+    if len < 7 || raw.len() < len {
+        return Err(Error::Reply(format!("bad LEN {len}")));
+    }
+    if raw[len - 1] != 0xFD {
+        return Err(Error::Reply(format!("bad terminator 0x{:02X}", raw[len - 1])));
+    }
+    let sum: u32 = raw[0..len - 2].iter().map(|&b| b as u32).sum();
+    let expect = !(sum as u8);
+    if raw[len - 2] != expect {
+        return Err(Error::Reply(format!(
+            "bad checksum 0x{:02X} != 0x{expect:02X}",
+            raw[len - 2]
+        )));
+    }
+    Ok(raw[4..len - 2].to_vec())
 }
 
 /// Assemble a 4-byte-UID block 0: `UID | BCC | SAK | ATQA(2) | 8 manufacturer bytes`.
@@ -817,6 +849,220 @@ impl WCopy {
     }
 }
 
+// --------------------------------------------------------------------------- //
+// 125 kHz LF side (vendor MCU command family, `FF 00 <op> ...`, no PN532 `D4`
+// wrapper). Reverse-engineered from a USB capture of the vendor's Windows tool
+// reading/beeping an EM4100 card; see README "125 kHz (LF) support" section.
+// --------------------------------------------------------------------------- //
+const LF_OP_DEVICE_INFO: u8 = 0x68;
+const LF_OP_SERIAL: u8 = 0x69;
+const LF_OP_INIT: u8 = 0x62;
+const LF_OP_READ_EM4100: u8 = 0x65;
+const LF_OP_WRITE_EM4100: u8 = 0x66;
+const LF_OP_BEEP: u8 = 0x40;
+/// Fixed 6-byte prefix every `0x66` (LF write) param blob starts with, before the
+/// command-specific suffix. Meaning unknown; byte-identical across every real capture.
+const LF_WRITE_PREFIX: [u8; 6] = [0x00, 0x1E, 0x48, 0xE8, 0x01, 0x00];
+
+/// 5-byte EM4100/EM4102 125 kHz tag ID: 1 version/customer byte + 4 ID bytes.
+pub type LfId = [u8; 5];
+
+impl WCopy {
+    /// Send a vendor-MCU payload (`FF 00 <op> <params...>`) and return the reply's data
+    /// bytes (the 4-byte `02 LEN seqLo seqHi` header and trailing checksum/terminator
+    /// stripped off). Unlike [`WCopy::transceive`], there is no PN532 `D4`/`D5` TFI layer
+    /// here — these are talking straight to the reader's own MCU firmware.
+    fn transceive_vendor(&mut self, op: u8, params: &[u8], timeout_ms: i32) -> Result<Vec<u8>> {
+        let mut payload = vec![0xFF, 0x00, op];
+        payload.extend_from_slice(params);
+        let raw = self.transceive_raw(&payload, timeout_ms)?;
+        parse_vendor_reply(&raw)
+    }
+
+    /// Vendor device/version string, e.g. `"wCopy NSR121-IDIC V705N2"`.
+    pub fn lf_device_info(&mut self) -> Result<String> {
+        let d = self.transceive_vendor(LF_OP_DEVICE_INFO, &[], 1500)?;
+        Ok(String::from_utf8_lossy(&d).trim_end_matches('\0').to_string())
+    }
+
+    /// Vendor serial number string, e.g. `"T39190010249"`.
+    pub fn lf_serial(&mut self) -> Result<String> {
+        let d = self.transceive_vendor(LF_OP_SERIAL, &[], 1500)?;
+        Ok(String::from_utf8_lossy(&d).trim_end_matches('\0').to_string())
+    }
+
+    /// Two-step LF init/config handshake the vendor tool always sends once at connect,
+    /// before the first `lf_read_em4100`. Exact meaning of the parameter bytes is not
+    /// understood; they are fixed values copied from a real capture.
+    pub fn lf_init(&mut self) -> Result<()> {
+        self.transceive_vendor(LF_OP_INIT, &[0x01, 0x00], 1500)?;
+        self.transceive_vendor(
+            LF_OP_INIT,
+            &[0x01, 0x06, 0x00, 0x00, 0x1f, 0x01, 0xfa, 0x00],
+            1500,
+        )?;
+        Ok(())
+    }
+
+    /// Read a 125 kHz EM4100/EM4102 tag's ID. Returns `None` if no tag is on the reader
+    /// (the device replies with a single `0x00` byte). Call [`WCopy::lf_init`] once first.
+    pub fn lf_read_em4100(&mut self) -> Result<Option<LfId>> {
+        let d = self.transceive_vendor(
+            LF_OP_READ_EM4100,
+            &[0x05, 0x1e, 0x48, 0xe8, 0x01, 0x00, 0x81, 0x01, 0x18, 0x01],
+            1500,
+        )?;
+        if d.len() == 6 && d[0] == 0x05 {
+            let mut id = [0u8; 5];
+            id.copy_from_slice(&d[1..6]);
+            Ok(Some(id))
+        } else if d == [0x00] {
+            // The device's own "no tag present" reply.
+            Ok(None)
+        } else {
+            Err(Error::Reply(format!("unexpected LF read reply: {d:02X?}")))
+        }
+    }
+
+    /// Buzzer + LED feedback (what the vendor tool fires after a successful read).
+    pub fn beep(&mut self) -> Result<()> {
+        self.transceive_vendor(LF_OP_BEEP, &[0x50, 0x04, 0x05, 0x01, 0x01, 0x01], 1500)?;
+        Ok(())
+    }
+
+    /// Write a 5-byte EM4100 ID to a T5577/EM4305-family 125 kHz tag (the vendor tool's
+    /// "WriteT5577/5200" button). Verified against real hardware across several different
+    /// target IDs on a genuine T5577 blank, each confirmed by reading it back afterwards.
+    ///
+    /// **Caveat, confirmed on real hardware:** an `id` whose first byte (the EM4100
+    /// version/customer byte) is very high — `0x98`/`0x99` tested — reliably fails and can
+    /// leave the tag temporarily unreadable (recovered by writing a working ID again; no
+    /// permanent damage seen). This reproduces identically through the **vendor's own**
+    /// nfcPro tool, not just this reimplementation, so it looks like a real limitation of the
+    /// tag/reader rather than a bug here. `0x00`, `0x07`, `0x12` all wrote fine; the exact
+    /// cutoff wasn't determined. Treat a very high first byte as unsupported for now.
+    ///
+    /// Two of the raw block writes below (`block1`/`block2`) carry the **standard EM4100
+    /// 64-bit encoded bitstream** for `id` — header + 10×(nibble + row parity) + column
+    /// parity + stop bit, see [`em4100_bitstream`] — split into two 4-byte halves. This was
+    /// confirmed by capturing three real successful writes (different IDs, same physical
+    /// tag) and finding the computed bitstream matches those block bytes exactly every time;
+    /// an earlier version of this function replayed one capture's bytes verbatim and, as
+    /// expected once this was understood, only worked for that one specific ID.
+    ///
+    /// The rest (the four `"Tian"`-watermarked frames, and the `0000148050` config-block
+    /// write) stayed byte-identical across all three captures and are replayed verbatim; their
+    /// detailed meaning (likely a vendor signature + T5577 config word) wasn't decoded further.
+    /// Does **not** work on a genuine (factory read-only) EM4100 tag — the vendor tool's own
+    /// type-specific write buttons don't either, confirmed on real hardware (all of them fail
+    /// the same way a plain EM4100 does).
+    pub fn lf_write_em4100(&mut self, id: &LfId) -> Result<()> {
+        let stream = em4100_bitstream(id);
+        let (block1, block2) = (&stream[0..4], &stream[4..8]);
+
+        let mut setup: Vec<Vec<u8>> = vec![
+            vec![0x1F, 0x18, 0x01, 0xEF, 0x00, 0x9B, 0x00, 0x86, 0x01],
+            vec![0x13, 0x00, 0x07, 0x54, 0x69, 0x61, 0x6E, 0xC0, 0xF5, 0x00, 0x9A],
+            vec![0x13, 0x00, 0x07, 0x54, 0x69, 0x61, 0x6E, 0x00, 0x00, 0x00, 0x00],
+            vec![0x13, 0x00, 0x07, 0x54, 0x69, 0x61, 0x6E, 0x19, 0x92, 0x04, 0x27],
+            vec![0x13, 0x00, 0x07, 0x54, 0x69, 0x61, 0x6E, 0x1C, 0x0B, 0x58, 0x48],
+        ];
+        let mut block1_write = vec![0x12, 0x00, 0x01];
+        block1_write.extend_from_slice(block1);
+        setup.push(block1_write);
+        let mut block1_verify = vec![0x13, 0x00, 0x01];
+        block1_verify.extend_from_slice(block1);
+        block1_verify.extend_from_slice(b"Tian");
+        setup.push(block1_verify);
+        let mut block2_write = vec![0x12, 0x00, 0x02];
+        block2_write.extend_from_slice(block2);
+        setup.push(block2_write);
+        let mut block2_verify = vec![0x13, 0x00, 0x02];
+        block2_verify.extend_from_slice(block2);
+        block2_verify.extend_from_slice(b"Tian");
+        setup.push(block2_verify);
+        setup.push(vec![0x12, 0x00, 0x00, 0x00, 0x14, 0x80, 0x50]);
+        setup.push(vec![
+            0x13, 0x00, 0x00, 0x00, 0x14, 0x80, 0x50, 0x54, 0x69, 0x61, 0x6E,
+        ]);
+        setup.push(vec![0x00, 0x64, 0x00, 0x00]);
+
+        for suffix in &setup {
+            let mut params = LF_WRITE_PREFIX.to_vec();
+            params.extend_from_slice(suffix);
+            self.transceive_vendor(LF_OP_WRITE_EM4100, &params, 1500)?;
+            // Real captures show ~30-100ms between these (the tag's own EEPROM write/settle
+            // time, not just HID latency); sending them back-to-back silently fails on real
+            // hardware even though every reply still parses OK.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // The vendor tool waits noticeably longer (~200ms) right before this final frame,
+        // which is the one that actually commits the new ID.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let mut params = LF_WRITE_PREFIX.to_vec();
+        params.push(0x01);
+        params.extend_from_slice(id);
+        self.transceive_vendor(LF_OP_WRITE_EM4100, &params, 1500)?;
+        self.beep()?;
+        Ok(())
+    }
+}
+
+/// First-byte threshold above which [`lf_id_likely_unsupported`] flags an ID. Confirmed
+/// failing on real hardware at `0x98`/`0x99` (both through this driver and through the
+/// vendor's own nfcPro tool); the exact cutoff below that wasn't determined, so this is a
+/// conservative (possibly over-wide) guess, not a proven boundary.
+pub const LF_WRITE_RISKY_FIRST_BYTE: u8 = 0x98;
+
+/// True if `id`'s first byte (the EM4100 version/customer byte) is at or above
+/// [`LF_WRITE_RISKY_FIRST_BYTE`], where [`WCopy::lf_write_em4100`] is known to reliably fail
+/// and can leave the tag temporarily unreadable. Callers (the CLI, the GUI) should warn
+/// before, or refuse to, write such an ID — this function doesn't refuse on its own, since
+/// read-only diagnostics and future chip families may want to try anyway.
+pub fn lf_id_likely_unsupported(id: &LfId) -> bool {
+    id[0] >= LF_WRITE_RISKY_FIRST_BYTE
+}
+
+/// Standard EM4100/EM4102 64-bit encoded bitstream for a 5-byte (40-bit) tag ID: 9 header
+/// bits of `1`, then the ID's 10 nibbles each followed by an even row-parity bit, then a
+/// 4-bit even column-parity nibble, then a stop bit (`0`) — packed MSB-first into 8 bytes.
+/// Confirmed against three real captured T5577 writes (see [`WCopy::lf_write_em4100`]).
+pub fn em4100_bitstream(id: &LfId) -> [u8; 8] {
+    let mut bits = [false; 64];
+    for bit in bits.iter_mut().take(9) {
+        *bit = true;
+    }
+    let mut col_parity = [false; 4];
+    let mut pos = 9;
+    for &byte in id {
+        for nibble in [(byte >> 4) & 0xF, byte & 0xF] {
+            let b = [(nibble >> 3) & 1, (nibble >> 2) & 1, (nibble >> 1) & 1, nibble & 1];
+            let mut row_parity = false;
+            for (i, &bit) in b.iter().enumerate() {
+                let set = bit != 0;
+                bits[pos + i] = set;
+                row_parity ^= set;
+                col_parity[i] ^= set;
+            }
+            bits[pos + 4] = row_parity;
+            pos += 5;
+        }
+    }
+    for (i, &p) in col_parity.iter().enumerate() {
+        bits[pos + i] = p;
+    }
+    // bits[63] (stop bit) stays `false` == 0.
+    let mut out = [0u8; 8];
+    for (i, chunk) in bits.chunks(8).enumerate() {
+        let mut byte = 0u8;
+        for &bit in chunk {
+            byte = (byte << 1) | (bit as u8);
+        }
+        out[i] = byte;
+    }
+    out
+}
+
 fn hexk(k: MifareKey) -> String {
     k.iter().map(|b| format!("{b:02X}")).collect()
 }
@@ -863,5 +1109,108 @@ mod tests {
         assert_eq!(b[4], 0xF0 ^ 0x73 ^ 0x63 ^ 0x2C);
         assert_eq!(b[5], 0x08);
         assert_eq!(&b[6..8], &[0x04, 0x00]);
+    }
+
+    // -- 125 kHz LF (vendor MCU) framing, bytes taken from a real USB capture of the
+    // vendor's Windows tool reading an EM4100 card with ID 07 00 CD 6D 41. --------------- //
+
+    #[test]
+    fn lf_device_info_report_bytes() {
+        // real OUT frame: 01 09 00 00 ff 00 68 8e fe
+        let r = build_report_raw(&[0xFF, 0x00, 0x68], 0).unwrap();
+        assert_eq!(r[0], 0x00);
+        assert_eq!(&r[1..10], &[0x01, 0x09, 0x00, 0x00, 0xFF, 0x00, 0x68, 0x8E, 0xFE]);
+    }
+
+    #[test]
+    fn lf_read_report_bytes() {
+        // real OUT frame (seq=0x14): 01 13 14 00 ff 00 65 05 1e 48 e8 01 00 81 01 18 01 84 fe
+        let r = build_report_raw(
+            &[0xFF, 0x00, 0x65, 0x05, 0x1E, 0x48, 0xE8, 0x01, 0x00, 0x81, 0x01, 0x18, 0x01],
+            0x14,
+        )
+        .unwrap();
+        assert_eq!(
+            &r[1..20],
+            &[
+                0x01, 0x13, 0x14, 0x00, 0xFF, 0x00, 0x65, 0x05, 0x1E, 0x48, 0xE8, 0x01, 0x00,
+                0x81, 0x01, 0x18, 0x01, 0x84, 0xFE
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_vendor_reply_em4100_id() {
+        // real IN frame: tag ID 07 00 CD 6D 41
+        let raw = [
+            0x02, 0x0C, 0x15, 0x00, 0x05, 0x07, 0x00, 0xCD, 0x6D, 0x41, 0x55, 0xFD,
+        ];
+        assert_eq!(parse_vendor_reply(&raw).unwrap(), vec![0x05, 0x07, 0x00, 0xCD, 0x6D, 0x41]);
+    }
+
+    #[test]
+    fn parse_vendor_reply_no_tag() {
+        // real IN frame: no card on reader
+        let raw = [0x02, 0x07, 0x5F, 0x00, 0x00, 0x97, 0xFD];
+        assert_eq!(parse_vendor_reply(&raw).unwrap(), vec![0x00]);
+    }
+
+    #[test]
+    fn parse_vendor_reply_bad_checksum() {
+        let mut raw = [0x02, 0x07, 0x5F, 0x00, 0x00, 0x97, 0xFD];
+        raw[5] ^= 0xFF; // corrupt the checksum byte
+        assert!(matches!(parse_vendor_reply(&raw), Err(Error::Reply(_))));
+    }
+
+    #[test]
+    fn parse_vendor_reply_timeout() {
+        assert!(matches!(parse_vendor_reply(&[]), Err(Error::Reply(_))));
+    }
+
+    #[test]
+    fn em4100_bitstream_matches_three_real_captures() {
+        // Each (id, expected block1||block2) pair is from a real successful WriteT5577/5200
+        // capture, writing a different ID to the same physical T5577 tag each time.
+        let cases: &[(&[u8; 5], &str)] = &[
+            (&[0x00, 0x00, 0x00, 0x20, 0x49], "ff8000000050265e"),
+            (&[0x00, 0x00, 0x00, 0x20, 0x50], "ff8000000050280e"),
+            (&[0x00, 0x00, 0x00, 0x20, 0x51], "ff8000000050286c"),
+        ];
+        for (id, expect_hex) in cases {
+            let got = em4100_bitstream(id);
+            let expect = {
+                let digits = expect_hex.as_bytes();
+                let mut v = [0u8; 8];
+                for i in 0..8 {
+                    v[i] = u8::from_str_radix(
+                        std::str::from_utf8(&digits[i * 2..i * 2 + 2]).unwrap(),
+                        16,
+                    )
+                    .unwrap();
+                }
+                v
+            };
+            assert_eq!(got, expect, "id {:02X?} -> {:02X?}, expected {:02X?}", id, got, expect);
+        }
+    }
+
+    #[test]
+    fn lf_write_id_commit_frame_matches_real_capture() {
+        // Real OUT frame from a verified-successful WriteT5577/5200 (wrote ID 00 00 00 20 49
+        // to a genuine T5577 blank, confirmed by reading it back): seq=0x0206.
+        // 01 15 06 02 ff 00 66 00 1e 48 e8 01 00 01 00 00 00 20 49 c3 fe
+        let payload = [
+            0xFF, 0x00, 0x66, 0x00, 0x1E, 0x48, 0xE8, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x20,
+            0x49,
+        ];
+        let r = build_report_raw(&payload, 0x0206).unwrap();
+        assert_eq!(
+            &r[1..21],
+            &[
+                0x01, 0x15, 0x06, 0x02, 0xFF, 0x00, 0x66, 0x00, 0x1E, 0x48, 0xE8, 0x01, 0x00,
+                0x01, 0x00, 0x00, 0x00, 0x20, 0x49, 0xC3
+            ]
+        );
+        assert_eq!(r[21], 0xFE);
     }
 }
