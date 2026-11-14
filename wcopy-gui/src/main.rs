@@ -30,6 +30,9 @@ enum Cmd {
     Dump,                        // MIFARE Classic 1K: crack + dump
     ReadBlock(u8),               // dictionary-auth + read block
     WriteBlock(u8, [u8; 16]),    // dictionary-auth + write block (+ verify)
+    LfRead,                      // 125 kHz: init + read one EM4100 tag
+    LfWrite([u8; 5]),            // 125 kHz: write EM4100 ID to a T5577/5200 tag (+ verify)
+    LfBeep,
 }
 
 enum Evt {
@@ -42,6 +45,11 @@ enum Evt {
     Dumped(MifareDump),
     Block { block: u8, data: [u8; 16] },
     BlockWritten { block: u8, ok: bool },
+    LfTagRead(Option<[u8; 5]>),
+    /// `id` is what we tried to write; `readback` is what the post-write read actually saw
+    /// (`None` if no tag responded at all — different from a tag responding with the wrong ID).
+    LfWritten { id: [u8; 5], readback: Option<[u8; 5]> },
+    LfBeeped,
     Error(String),
 }
 
@@ -143,6 +151,36 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Evt>, ctx: egui::Context) {
                         ok: back == data,
                     }),
                     Err(e) => send(Evt::Error(format!("write block {n} failed: {e}"))),
+                },
+            },
+            Cmd::LfRead => match dev.as_mut() {
+                None => send(Evt::Error("not connected".into())),
+                Some(d) => match d.lf_init().and_then(|_| d.lf_read_em4100()) {
+                    Ok(id) => send(Evt::LfTagRead(id)),
+                    Err(e) => send(Evt::Error(format!("LF read failed: {e}"))),
+                },
+            },
+            Cmd::LfWrite(id) => match dev.as_mut() {
+                None => send(Evt::Error("not connected".into())),
+                Some(d) => {
+                    send(Evt::Log(format!(
+                        "writing LF ID {} (T5577/5200) …",
+                        hex_bytes(&id)
+                    )));
+                    match d.lf_write_em4100(&id).and_then(|_| {
+                        d.lf_init()?;
+                        d.lf_read_em4100()
+                    }) {
+                        Ok(back) => send(Evt::LfWritten { id, readback: back }),
+                        Err(e) => send(Evt::Error(format!("LF write failed: {e}"))),
+                    }
+                }
+            },
+            Cmd::LfBeep => match dev.as_mut() {
+                None => send(Evt::Error("not connected".into())),
+                Some(d) => match d.beep() {
+                    Ok(()) => send(Evt::LfBeeped),
+                    Err(e) => send(Evt::Error(format!("beep failed: {e}"))),
                 },
             },
         }
@@ -261,6 +299,10 @@ struct App {
     block_num: u8,
     block_data: String,
 
+    // 125 kHz (LF)
+    last_lf_id: Option<[u8; 5]>,
+    lf_manual_text: String,
+
     log: Vec<String>,
 }
 
@@ -289,6 +331,8 @@ impl App {
             last_dump: None,
             block_num: 1,
             block_data: "00000000000000000000000000000000".to_string(),
+            last_lf_id: None,
+            lf_manual_text: "0000000000".to_string(),
             log: vec!["connecting…".into()],
         }
     }
@@ -364,6 +408,38 @@ impl App {
                         "wrote block {block}: verify {}",
                         if ok { "OK" } else { "MISMATCH" }
                     ));
+                }
+                Evt::LfTagRead(id) => {
+                    self.busy = false;
+                    match id {
+                        Some(id) => {
+                            self.log(format!("LF tag read: {}", hex_bytes(&id)));
+                            self.last_lf_id = Some(id);
+                        }
+                        None => self.log("LF: no 125 kHz tag on reader"),
+                    }
+                }
+                Evt::LfWritten { id, readback } => {
+                    self.busy = false;
+                    let id_s = hex_bytes(&id);
+                    match readback {
+                        Some(back) if back == id => {
+                            self.log(format!("LF write {id_s}: verify OK"));
+                            self.last_lf_id = Some(id);
+                        }
+                        Some(back) => self.log(format!(
+                            "LF write {id_s}: verify MISMATCH, tag now reads {}",
+                            hex_bytes(&back)
+                        )),
+                        None => self.log(format!(
+                            "LF write {id_s}: could not read a tag back to verify \
+                             (re-tap it and try \"Read tag\" to check)"
+                        )),
+                    }
+                }
+                Evt::LfBeeped => {
+                    self.busy = false;
+                    self.log("beeped");
                 }
                 Evt::Error(e) => {
                     self.busy = false;
@@ -642,6 +718,72 @@ impl eframe::App for App {
                                     ui.monospace(dump.to_text());
                                 });
                         });
+                }
+            });
+
+            ui.add_space(6.0);
+
+            // -- 5) 125 kHz (LF) EM4100 read/write ------------------------------ //
+            ui.group(|ui| {
+                ui.strong("5 · 125 kHz (LF) — EM4100");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_op, egui::Button::new("Read tag"))
+                        .clicked()
+                    {
+                        self.send(Cmd::LfRead);
+                    }
+                    if ui.add_enabled(can_op, egui::Button::new("Beep")).clicked() {
+                        self.send(Cmd::LfBeep);
+                    }
+                    if let Some(id) = &self.last_lf_id {
+                        ui.weak(format!("last ID: {}", hex_bytes(id)));
+                    }
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Write ID:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.lf_manual_text)
+                            .desired_width(160.0)
+                            .hint_text("10 hex digits, e.g. 0000002049"),
+                    );
+                });
+                let parsed_lf = parse_hex_n(&self.lf_manual_text, 5).map(|b| {
+                    let mut id = [0u8; 5];
+                    id.copy_from_slice(&b);
+                    id
+                });
+                let risky = matches!(&parsed_lf, Ok(id) if wcopy::lf_id_likely_unsupported(id));
+                match &parsed_lf {
+                    Ok(_) if risky => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 140, 40),
+                            format!(
+                                "first byte ≥ 0x{:02X} reliably fails on real hardware \
+                                 (confirmed via this tool and the vendor's own app) and can \
+                                 leave the tag temporarily unreadable -- write disabled",
+                                wcopy::LF_WRITE_RISKY_FIRST_BYTE
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        ui.colored_label(egui::Color32::from_rgb(210, 90, 90), format!("invalid: {e}"));
+                    }
+                    _ => {}
+                }
+                ui.label("Requires a writable T5577/5200 tag.");
+                if ui
+                    .add_enabled(
+                        can_op && parsed_lf.is_ok() && !risky,
+                        egui::Button::new("Write to tag"),
+                    )
+                    .clicked()
+                {
+                    if let Ok(id) = parsed_lf {
+                        self.send(Cmd::LfWrite(id));
+                    }
                 }
             });
                 }); // close ScrollArea

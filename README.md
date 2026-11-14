@@ -166,6 +166,11 @@ against. The EM4100 bitstream math above is chip-agnostic and should carry over,
 `0x66`-equivalent command framing for those families is unknown; don't guess at it blindly,
 capture a real successful write first (see the three-ID technique above).
 
+LF support in the tools: `wcopy-gui` has a "125 kHz (LF)" section (read, write, beep),
+mirroring the CLI flags. `wcopy-wedge` does **not** have LF support yet — it only types a
+presented tag's HF (Mifare/ISO14443A) UID; adding an EM4100 mode (poll with `lf_read_em4100`
+instead of `read_tag`) would need the same kind of change `wcopy-gui` already got.
+
 ## Supported cards
 
 - **ISO14443A UID read** — any 13.56 MHz Type A tag.

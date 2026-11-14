@@ -1008,6 +1008,21 @@ impl WCopy {
     }
 }
 
+/// First-byte threshold above which [`lf_id_likely_unsupported`] flags an ID. Confirmed
+/// failing on real hardware at `0x98`/`0x99` (both through this driver and through the
+/// vendor's own nfcPro tool); the exact cutoff below that wasn't determined, so this is a
+/// conservative (possibly over-wide) guess, not a proven boundary.
+pub const LF_WRITE_RISKY_FIRST_BYTE: u8 = 0x98;
+
+/// True if `id`'s first byte (the EM4100 version/customer byte) is at or above
+/// [`LF_WRITE_RISKY_FIRST_BYTE`], where [`WCopy::lf_write_em4100`] is known to reliably fail
+/// and can leave the tag temporarily unreadable. Callers (the CLI, the GUI) should warn
+/// before, or refuse to, write such an ID — this function doesn't refuse on its own, since
+/// read-only diagnostics and future chip families may want to try anyway.
+pub fn lf_id_likely_unsupported(id: &LfId) -> bool {
+    id[0] >= LF_WRITE_RISKY_FIRST_BYTE
+}
+
 /// Standard EM4100/EM4102 64-bit encoded bitstream for a 5-byte (40-bit) tag ID: 9 header
 /// bits of `1`, then the ID's 10 nibbles each followed by an even row-parity bit, then a
 /// 4-bit even column-parity nibble, then a stop bit (`0`) — packed MSB-first into 8 bytes.
